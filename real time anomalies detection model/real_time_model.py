@@ -1,0 +1,660 @@
+import os
+import threading
+import pandas as pd
+import numpy as np
+import logging
+import time
+from collections import deque
+
+import dash
+from dash.dependencies import Output, Input
+from dash import dcc, html, dash_table
+import dash_bootstrap_components as dbc
+import plotly.graph_objs as go
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, to_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+from sklearn.ensemble import IsolationForest
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+# Thread-safe data storage
+data_lock = threading.Lock()
+
+# Data structures for each power plant type
+plant_types = ['Gas Plant', 'Wind Farm', 'Solar Farm', 'Hydroelectric Plant']
+
+# Define features for each plant type
+plant_features = {
+    'Gas Plant': ['power_output', 'demand', 'fuel_consumption', 'emissions'],
+    'Wind Farm': ['power_output', 'demand', 'wind_speed', 'turbine_efficiency'],
+    'Solar Farm': ['power_output', 'demand', 'solar_radiation', 'panel_temperature'],
+    'Hydroelectric Plant': ['power_output', 'demand', 'water_flow_rate', 'turbine_rotation_speed']
+}
+
+# Initialize data storage with a sliding window
+window_size = 500  # Adjust based on memory and performance
+data_store = {
+    plant_type: {
+        'data': deque(maxlen=window_size),
+        'outliers': pd.DataFrame()
+    } for plant_type in plant_types
+}
+
+def start_spark_streaming():
+    """
+    Start Spark Structured Streaming to read data from Kafka and process it in real-time.
+    """
+    # Create Spark Session
+    spark = SparkSession \
+        .builder \
+        .appName("EnergyStreamOutlierDetection") \
+        .master("spark://spark-master:7077") \
+        .config("spark.driver.host", "app") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
+        .getOrCreate()
+
+    # Define schema for incoming data
+    schema = StructType([
+        StructField("timestamp", StringType()),
+        StructField("plant_type", StringType()),
+        StructField("region", StringType()),
+        StructField("power_output", DoubleType()),
+        StructField("demand", DoubleType()),
+        StructField("grid_frequency", DoubleType()),
+        StructField("fuel_consumption", DoubleType()),
+        StructField("emissions", DoubleType()),
+        StructField("wind_speed", DoubleType()),
+        StructField("turbine_efficiency", DoubleType()),
+        StructField("solar_radiation", DoubleType()),
+        StructField("panel_temperature", DoubleType()),
+        StructField("water_flow_rate", DoubleType()),
+        StructField("turbine_rotation_speed", DoubleType())
+    ])
+
+    # Read from Kafka
+    df = spark \
+        .readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')) \
+        .option("subscribe", "energy_stream") \
+        .option("startingOffsets", "latest") \
+        .option("maxOffsetsPerTrigger", 1000) \
+        .load()
+
+    # Parse the JSON data
+    df = df.selectExpr("CAST(value AS STRING)")
+    df_parsed = df.select(from_json(col("value"), schema).alias("data")).select("data.*")
+
+    # Convert timestamp to proper format
+    df_parsed = df_parsed.withColumn("timestamp", to_timestamp(col("timestamp")))
+
+    # Function to process each batch
+    def process_batch(batch_df, batch_id):
+        """
+        Process each micro-batch of data from Spark Streaming.
+
+        Args:
+            batch_df (DataFrame): The batch data as a Spark DataFrame.
+            batch_id (int): The batch ID.
+        """
+        try:
+            pandas_df = batch_df.toPandas()
+            logging.info(f"Processing batch {batch_id} with {len(pandas_df)} records")
+
+            with data_lock:
+                for plant_type in plant_types:
+                    # Filter data for the current plant type
+                    plant_df = pandas_df[pandas_df['plant_type'] == plant_type]
+                    if plant_df.empty:
+                        continue
+
+                    # Select relevant features
+                    features = ['timestamp'] + plant_features[plant_type]
+                    plant_df = plant_df[features].dropna()
+
+                    if plant_df.empty:
+                        continue
+
+                    # Data Validation: Check data types and ranges
+                    for feature in plant_features[plant_type]:
+                        if not pd.api.types.is_numeric_dtype(plant_df[feature]):
+                            plant_df = plant_df.drop(columns=[feature])
+                            logging.warning(f"Dropped non-numeric feature {feature} in {plant_type}")
+
+                    # Append new data to the deque (sliding window)
+                    data_entries = data_store[plant_type]['data']
+                    data_entries.extend(plant_df.to_dict('records'))
+
+        except Exception as e:
+            logging.error(f"Error processing batch {batch_id}: {e}")
+
+    # Apply processing to each micro-batch
+    query = df_parsed.writeStream \
+        .trigger(processingTime='1 second') \
+        .foreachBatch(process_batch) \
+        .start()
+
+    query.awaitTermination()
+
+def perform_outlier_detection():
+    """
+    Perform outlier detection using Isolation Forest on a sliding window.
+    """
+    while True:
+        with data_lock:
+            for plant_type in plant_types:
+                data_entries = data_store[plant_type]['data']
+                if len(data_entries) < 50:
+                    continue  # Need sufficient data
+
+                data_df = pd.DataFrame(list(data_entries))
+                features = plant_features[plant_type]
+                data_features = data_df[features].astype(float)
+
+                # Algorithm Explanation:
+                # Isolation Forest is an unsupervised learning algorithm for anomaly detection
+                # that isolates anomalies instead of profiling normal data points. It works well
+                # with high-dimensional data and is effective in detecting anomalies in the presence
+                # of concept drift and seasonal variations due to its tree-based structure.
+
+                # Fit Isolation Forest on sliding window
+                isolation_forest = IsolationForest(contamination=0.05, random_state=42)
+                outlier_labels = isolation_forest.fit_predict(data_features)
+
+                # Identify outliers
+                outlier_indices = np.where(outlier_labels == -1)[0]
+                if len(outlier_indices) > 0:
+                    outliers_df = data_df.iloc[outlier_indices]
+                    data_store[plant_type]['outliers'] = outliers_df
+                    logging.info(f"Detected {len(outlier_indices)} outliers for {plant_type}")
+                else:
+                    data_store[plant_type]['outliers'] = pd.DataFrame()
+
+                # Limit outliers DataFrame size
+                max_outliers = 100
+                if len(data_store[plant_type]['outliers']) > max_outliers:
+                    data_store[plant_type]['outliers'] = data_store[plant_type]['outliers'].iloc[-max_outliers:]
+
+        time.sleep(5)  # Wait before next detection cycle
+
+# ============================================================================
+# UI / THEME CONFIGURATION
+# ============================================================================
+# Initialize Dash app
+external_stylesheets = [
+    dbc.themes.CYBORG,
+    dbc.icons.FONT_AWESOME,
+    "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap",
+]
+app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
+app.title = "Cobblestone Energy Efficient Data Stream Anomaly Detection"
+
+# ---- Palette: dark "control room" theme, one accent per plant type ----
+bg_app = '#0B0F14'          # page background - near-black slate
+bg_panel = '#121821'        # card / panel background
+bg_panel_alt = '#161D28'    # header strip inside cards
+border_soft = '#232C38'     # hairline borders
+text_primary = '#E8EDF2'    # headings / primary text
+text_muted = '#8A97A8'      # secondary / muted text
+grid_line = '#1D2530'       # chart gridlines
+
+plant_theme = {
+    'Gas Plant': {
+        'accent': '#FF8A3D',       # flame orange
+        'accent_soft': 'rgba(255, 138, 61, 0.12)',
+        'icon': 'fa-solid fa-fire-flame-curved',
+        'line_colors': ['#F2545B', '#F7B32B', '#4CC9F0', '#B084CC'],
+        'subtitle': 'Combustion & fuel efficiency monitoring',
+    },
+    'Wind Farm': {
+        'accent': '#3DDC97',       # turbine teal-green
+        'accent_soft': 'rgba(61, 220, 151, 0.12)',
+        'icon': 'fa-solid fa-wind',
+        'line_colors': ['#00C2D1', '#F7B32B', '#F2545B', '#8AC926'],
+        'subtitle': 'Turbine performance & wind conditions',
+    },
+    'Solar Farm': {
+        'accent': '#FFD23F',       # solar gold
+        'accent_soft': 'rgba(255, 210, 63, 0.12)',
+        'icon': 'fa-solid fa-solar-panel',
+        'line_colors': ['#F2545B', '#4CC9F0', '#F7B32B', '#8AC926'],
+        'subtitle': 'Irradiance & panel thermal behavior',
+    },
+    'Hydroelectric Plant': {
+        'accent': '#3DA9FC',       # water blue
+        'accent_soft': 'rgba(61, 169, 252, 0.12)',
+        'icon': 'fa-solid fa-water',
+        'line_colors': ['#00C2D1', '#F7B32B', '#F2545B', '#B084CC'],
+        'subtitle': 'Flow rate & turbine rotation dynamics',
+    },
+}
+
+outlier_marker_color = '#FF3B5C'  # consistent alert-red across all plants
+
+FONT_HEADING = "'Space Grotesk', sans-serif"
+FONT_BODY = "'Inter', sans-serif"
+FONT_MONO = "'JetBrains Mono', monospace"
+
+# Custom index string: sets global font, background, scrollbar and subtle card styling
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            html, body {
+                background-color: ''' + bg_app + ''' !important;
+                font-family: ''' + FONT_BODY + ''';
+            }
+            ::-webkit-scrollbar { width: 10px; height: 10px; }
+            ::-webkit-scrollbar-track { background: ''' + bg_app + '''; }
+            ::-webkit-scrollbar-thumb { background: ''' + border_soft + '''; border-radius: 6px; }
+            ::-webkit-scrollbar-thumb:hover { background: #33404F; }
+
+            .plant-card {
+                background-color: ''' + bg_panel + ''';
+                border: 1px solid ''' + border_soft + ''';
+                border-radius: 14px;
+                overflow: hidden;
+                transition: box-shadow 0.2s ease, transform 0.2s ease;
+            }
+            .plant-card:hover {
+                box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+                transform: translateY(-2px);
+            }
+            .plant-card-header {
+                background-color: ''' + bg_panel_alt + ''';
+                border-bottom: 1px solid ''' + border_soft + ''';
+                padding: 16px 20px;
+            }
+            .plant-card-body { padding: 18px 20px 22px 20px; }
+
+            .metric-pill {
+                font-family: ''' + FONT_MONO + ''';
+                font-size: 11px;
+                letter-spacing: 0.06em;
+                padding: 3px 10px;
+                border-radius: 999px;
+                border: 1px solid currentColor;
+            }
+
+            .app-navbar {
+                background: linear-gradient(90deg, #0B0F14 0%, #121821 60%, #0B0F14 100%);
+                border-bottom: 1px solid ''' + border_soft + ''';
+            }
+
+            .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner table {
+                font-family: ''' + FONT_MONO + ''' !important;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
+
+
+def build_plant_card(plant_type):
+    """
+    Build a themed dashboard card (graph + anomaly table) for a given plant type.
+    Purely presentational - wraps the same dcc.Graph / dash_table.DataTable
+    components the callback already targets by id.
+    """
+    theme = plant_theme[plant_type]
+    slug = plant_type.lower().replace(' ', '-')
+    features = plant_features[plant_type]
+
+    return dbc.Col(
+        html.Div(
+            [
+                # Card header: icon + title + live status pill
+                html.Div(
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                html.Div(
+                                    [
+                                        html.I(
+                                            className=theme['icon'],
+                                            style={'color': theme['accent'], 'fontSize': '22px', 'marginRight': '12px'}
+                                        ),
+                                        html.Div(
+                                            [
+                                                html.Span(
+                                                    plant_type,
+                                                    style={
+                                                        'fontFamily': FONT_HEADING,
+                                                        'fontWeight': '600',
+                                                        'fontSize': '18px',
+                                                        'color': text_primary,
+                                                        'display': 'block'
+                                                    }
+                                                ),
+                                                html.Span(
+                                                    theme['subtitle'],
+                                                    style={
+                                                        'fontFamily': FONT_BODY,
+                                                        'fontSize': '12px',
+                                                        'color': text_muted,
+                                                    }
+                                                ),
+                                            ],
+                                            style={'display': 'inline-block', 'verticalAlign': 'middle'}
+                                        ),
+                                    ],
+                                    style={'display': 'flex', 'alignItems': 'center'}
+                                ),
+                                width='auto'
+                            ),
+                            dbc.Col(
+                                html.Span(
+                                    "LIVE",
+                                    className='metric-pill',
+                                    style={'color': theme['accent']}
+                                ),
+                                width='auto',
+                                className='ms-auto d-flex align-items-center'
+                            ),
+                        ],
+                        justify='between',
+                        align='center',
+                        className='g-0'
+                    ),
+                    className='plant-card-header'
+                ),
+
+                # Card body: graph + anomaly table
+                html.Div(
+                    [
+                        dcc.Graph(id=f'{slug}-graph', animate=False, config={'displayModeBar': False}),
+                        html.Div(
+                            [
+                                html.I(className='fa-solid fa-triangle-exclamation',
+                                       style={'color': outlier_marker_color, 'marginRight': '8px', 'fontSize': '13px'}),
+                                html.Span(
+                                    "Detected Anomalies",
+                                    style={
+                                        'fontFamily': FONT_HEADING,
+                                        'fontWeight': '600',
+                                        'fontSize': '14px',
+                                        'color': text_primary,
+                                        'letterSpacing': '0.02em',
+                                        'textTransform': 'uppercase'
+                                    }
+                                ),
+                            ],
+                            style={'margin': '18px 0 10px 0', 'display': 'flex', 'alignItems': 'center'}
+                        ),
+                        dash_table.DataTable(
+                            id=f'{slug}-table',
+                            columns=[{'name': f.replace('_', ' ').title(), 'id': f} for f in features],
+                            style_table={'overflowX': 'auto', 'borderRadius': '8px', 'border': f'1px solid {border_soft}'},
+                            style_cell={
+                                'textAlign': 'left',
+                                'minWidth': '100px',
+                                'backgroundColor': bg_panel,
+                                'color': text_primary,
+                                'border': f'1px solid {border_soft}',
+                                'fontFamily': FONT_MONO,
+                                'fontSize': '12px',
+                                'padding': '8px 10px',
+                            },
+                            style_header={
+                                'backgroundColor': bg_panel_alt,
+                                'color': theme['accent'],
+                                'fontWeight': '600',
+                                'fontFamily': FONT_BODY,
+                                'fontSize': '11px',
+                                'letterSpacing': '0.04em',
+                                'textTransform': 'uppercase',
+                                'border': f'1px solid {border_soft}',
+                            },
+                            style_data_conditional=[
+                                {
+                                    'if': {'row_index': 'odd'},
+                                    'backgroundColor': bg_panel_alt,
+                                }
+                            ],
+                            style_as_list_view=True,
+                            page_size=5,
+                        ),
+                    ],
+                    className='plant-card-body'
+                ),
+            ],
+            className='plant-card'
+        ),
+        xs=12, lg=12,
+        style={'marginBottom': '24px'}
+    )
+
+
+# Define app layout
+app.layout = html.Div(
+    [
+        # ---- Navbar ----
+        html.Div(
+            dbc.Container(
+                dbc.Row(
+                    [
+                        dbc.Col(
+                            html.Div(
+                                [
+                                    html.I(className='fa-solid fa-bolt',
+                                           style={'color': '#FFD23F', 'fontSize': '22px', 'marginRight': '12px'}),
+                                    html.Div(
+                                        [
+                                            html.Span(
+                                                "Cobblestone Energy",
+                                                style={
+                                                    'fontFamily': FONT_HEADING,
+                                                    'fontWeight': '700',
+                                                    'fontSize': '20px',
+                                                    'color': text_primary,
+                                                    'display': 'block',
+                                                    'lineHeight': '1.2'
+                                                }
+                                            ),
+                                            html.Span(
+                                                "Efficient Data Stream Anomaly Detection",
+                                                style={
+                                                    'fontFamily': FONT_BODY,
+                                                    'fontSize': '12px',
+                                                    'color': text_muted,
+                                                    'letterSpacing': '0.02em'
+                                                }
+                                            ),
+                                        ],
+                                        style={'display': 'inline-block', 'verticalAlign': 'middle'}
+                                    ),
+                                ],
+                                style={'display': 'flex', 'alignItems': 'center', 'padding': '16px 0'}
+                            ),
+                            width='auto'
+                        ),
+                        dbc.Col(
+                            html.Span(
+                                "REAL-TIME GRID MONITORING",
+                                className='metric-pill',
+                                style={'color': '#3DDC97'}
+                            ),
+                            width='auto',
+                            className='ms-auto d-flex align-items-center'
+                        ),
+                    ],
+                    justify='between',
+                    align='center',
+                    className='g-0'
+                ),
+                fluid=True
+            ),
+            className='app-navbar',
+            style={'marginBottom': '28px', 'position': 'sticky', 'top': 0, 'zIndex': 999}
+        ),
+
+        # ---- Plant cards grid ----
+        dbc.Container(
+            dbc.Row(
+                [build_plant_card(pt) for pt in plant_types],
+                className='g-4'
+            ),
+            fluid=True
+        ),
+
+        dcc.Interval(
+            id='graph-update',
+            interval=1 * 1000,  # Update every second
+            n_intervals=0
+        ),
+
+        # ---- Footer ----
+        html.Footer(
+            dbc.Container(
+                html.P(
+                    [
+                        html.I(className='fa-solid fa-bolt', style={'marginRight': '8px', 'color': text_muted}),
+                        "Real-Time Energy Efficient Data Stream Anomaly Detection — by Vinay"
+                    ],
+                    className="text-center",
+                    style={'color': text_muted, 'padding': '18px', 'fontFamily': FONT_BODY, 'fontSize': '12px', 'margin': 0}
+                )
+            ),
+            style={'borderTop': f'1px solid {border_soft}', 'marginTop': '32px'}
+        )
+    ],
+    style={'backgroundColor': bg_app, 'minHeight': '100vh', 'paddingBottom': '20px'}
+)
+
+@app.callback(
+    [
+        Output('gas-plant-graph', 'figure'),
+        Output('gas-plant-table', 'data'),
+        Output('wind-farm-graph', 'figure'),
+        Output('wind-farm-table', 'data'),
+        Output('solar-farm-graph', 'figure'),
+        Output('solar-farm-table', 'data'),
+        Output('hydroelectric-plant-graph', 'figure'),
+        Output('hydroelectric-plant-table', 'data'),
+    ],
+    [Input('graph-update', 'n_intervals')]
+)
+def update_graphs(n):
+    """
+    Update the graphs and tables in the Dash app with the latest data.
+
+    Args:
+        n (int): The number of intervals passed.
+
+    Returns:
+        tuple: Figures and table data for each power plant type.
+    """
+    try:
+        with data_lock:
+            figures = []
+            table_data = []
+            for plant_type in plant_types:
+                data_entries = data_store[plant_type]['data']
+                if not data_entries:
+                    figures.append(go.Figure())
+                    table_data.append([])
+                    continue
+
+                data_df = pd.DataFrame(list(data_entries))
+                outliers_df = data_store[plant_type]['outliers']
+
+                # Plot time series
+                features = plant_features[plant_type]
+                data_traces = []
+                # Line colors themed per plant type for better visibility against dark background
+                line_colors = plant_theme[plant_type]['line_colors']
+
+                for i, feature in enumerate(features):
+                    data_traces.append(
+                        go.Scatter(
+                            x=data_df['timestamp'],
+                            y=data_df[feature],
+                            mode='lines',
+                            name=f'{feature.replace("_", " ").title()}',
+                            line=dict(width=2, color=line_colors[i % len(line_colors)]),
+                            hoverinfo='text',
+                            hovertext=[
+                                f'Time: {t}<br>{feature.replace("_", " ").title()}: {v:.2f}'
+                                for t, v in zip(data_df['timestamp'], data_df[feature])
+                            ]
+                        )
+                    )
+
+                # Add outlier markers
+                if not outliers_df.empty:
+                    for i, feature in enumerate(features):
+                        data_traces.append(
+                            go.Scatter(
+                                x=outliers_df['timestamp'],
+                                y=outliers_df[feature],
+                                mode='markers',
+                                name=f'Outliers ({feature.replace("_", " ").title()})',
+                                marker=dict(color=outlier_marker_color, size=8, symbol='x'),
+                                hoverinfo='text',
+                                hovertext=[
+                                    f'Time: {t}<br>{feature.replace("_", " ").title()}: {v:.2f}'
+                                    for t, v in zip(outliers_df['timestamp'], outliers_df[feature])
+                                ]
+                            )
+                        )
+
+                layout = go.Layout(
+                    xaxis=dict(title='Time', color='#2B2F36', gridcolor='#E4E7EC', zerolinecolor='#E4E7EC'),
+                    yaxis=dict(title='Values', color='#2B2F36', gridcolor='#E4E7EC', zerolinecolor='#E4E7EC'),
+                    legend=dict(x=0, y=1, font=dict(color='#2B2F36', size=10), bgcolor='rgba(255,255,255,0)'),
+                    hovermode='closest',
+                    plot_bgcolor='#FFFFFF',    # Chart background set to white
+                    paper_bgcolor='#FFFFFF',   # Chart surround set to white
+                    font=dict(color='#2B2F36', family=FONT_BODY),
+                    margin=dict(l=50, r=20, t=20, b=40),
+                )
+
+                figures.append({'data': data_traces, 'layout': layout})
+
+                # Prepare table data
+                if not outliers_df.empty:
+                    table_entries = outliers_df[features + ['timestamp']].to_dict('records')
+                else:
+                    table_entries = []
+
+                table_data.append(table_entries)
+
+        return (
+            figures[0], table_data[0],
+            figures[1], table_data[1],
+            figures[2], table_data[2],
+            figures[3], table_data[3],
+        )
+    except Exception as e:
+        logging.error(f"Error in update_graphs: {e}")
+        empty_figure = go.Figure()
+        return empty_figure, [], empty_figure, [], empty_figure, [], empty_figure, []
+
+if __name__ == '__main__':
+    # Start Spark Streaming in a separate thread
+    streaming_thread = threading.Thread(target=start_spark_streaming, daemon=True)
+    streaming_thread.start()
+
+    # Start Outlier Detection in a separate thread
+    outlier_thread = threading.Thread(target=perform_outlier_detection, daemon=True)
+    outlier_thread.start()
+
+    # Run the Dash app
+    app.run(debug=False, host='0.0.0.0', port=8050)
