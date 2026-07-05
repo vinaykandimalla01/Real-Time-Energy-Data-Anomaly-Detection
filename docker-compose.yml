@@ -82,7 +82,7 @@ services:
       - kafka_spark_network
 
   app:
-    build: ./app
+    build: "./real time anomalies detection model"
     container_name: app
     depends_on:
       - kafka
@@ -93,7 +93,7 @@ services:
       - kafka_spark_network
 
   producer:
-    build: ./producer
+    build: "./data_producer"
     container_name: producer
     depends_on:
       - kafka

@@ -185,61 +185,67 @@ def perform_outlier_detection():
 # UI / THEME CONFIGURATION
 # ============================================================================
 # Initialize Dash app
-external_stylesheets = [
-    dbc.themes.CYBORG,
-    dbc.icons.FONT_AWESOME,
-    "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap",
-]
+external_stylesheets = [dbc.themes.DARKLY]
 app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
 app.title = "Cobblestone Energy Efficient Data Stream Anomaly Detection"
 
-# ---- Palette: dark "control room" theme, one accent per plant type ----
-bg_app = '#0B0F14'          # page background - near-black slate
-bg_panel = '#121821'        # card / panel background
-bg_panel_alt = '#161D28'    # header strip inside cards
-border_soft = '#232C38'     # hairline borders
-text_primary = '#E8EDF2'    # headings / primary text
-text_muted = '#8A97A8'      # secondary / muted text
-grid_line = '#1D2530'       # chart gridlines
+# ---- Palette: dark operations-console theme, restrained & semantic ----
+bg_app = '#0A0C0F'            # page background
+bg_panel = '#111418'          # card background
+bg_panel_header = '#0D0F13'   # header strip / table header background
+bg_chart = '#0D1013'          # plot area background (slightly recessed vs. card)
+border_color = '#20252C'      # hairline borders
+text_primary = '#E4E6E9'      # headings / primary text
+text_secondary = '#9BA1AA'    # axis labels, table text, body copy
+text_tertiary = '#5C636D'     # placeholders, faint captions
+grid_line = '#1A1E24'         # chart gridlines
 
+status_live = '#4C9E6B'       # muted green - "live" indicator
+status_alert = '#D1544A'      # muted red - anomalies, used everywhere anomalies appear
+
+# One muted accent per plant type, used only as a small identifier
+# (left border + header mark) rather than a decorative wash.
 plant_theme = {
     'Gas Plant': {
-        'accent': '#FF8A3D',       # flame orange
-        'accent_soft': 'rgba(255, 138, 61, 0.12)',
-        'icon': 'fa-solid fa-fire-flame-curved',
-        'line_colors': ['#F2545B', '#F7B32B', '#4CC9F0', '#B084CC'],
+        'accent': '#C9813F',
         'subtitle': 'Combustion & fuel efficiency monitoring',
     },
     'Wind Farm': {
-        'accent': '#3DDC97',       # turbine teal-green
-        'accent_soft': 'rgba(61, 220, 151, 0.12)',
-        'icon': 'fa-solid fa-wind',
-        'line_colors': ['#00C2D1', '#F7B32B', '#F2545B', '#8AC926'],
+        'accent': '#4C9E85',
         'subtitle': 'Turbine performance & wind conditions',
     },
     'Solar Farm': {
-        'accent': '#FFD23F',       # solar gold
-        'accent_soft': 'rgba(255, 210, 63, 0.12)',
-        'icon': 'fa-solid fa-solar-panel',
-        'line_colors': ['#F2545B', '#4CC9F0', '#F7B32B', '#8AC926'],
+        'accent': '#C9A227',
         'subtitle': 'Irradiance & panel thermal behavior',
     },
     'Hydroelectric Plant': {
-        'accent': '#3DA9FC',       # water blue
-        'accent_soft': 'rgba(61, 169, 252, 0.12)',
-        'icon': 'fa-solid fa-water',
-        'line_colors': ['#00C2D1', '#F7B32B', '#F2545B', '#B084CC'],
+        'accent': '#3E7CA6',
         'subtitle': 'Flow rate & turbine rotation dynamics',
     },
 }
 
-outlier_marker_color = '#FF3B5C'  # consistent alert-red across all plants
+# Every metric keeps the same colour on every chart it appears on, so e.g.
+# "power_output" reads the same way across all four panels.
+FEATURE_COLORS = {
+    'power_output':          '#4E79A7',
+    'demand':                '#F28E2B',
+    'fuel_consumption':      '#E15759',
+    'emissions':             '#B07AA1',
+    'wind_speed':            '#59A14F',
+    'turbine_efficiency':    '#76B7B2',
+    'solar_radiation':       '#EDC948',
+    'panel_temperature':     '#9C755F',
+    'water_flow_rate':       '#59A14F',
+    'turbine_rotation_speed': '#76B7B2',
+}
 
-FONT_HEADING = "'Space Grotesk', sans-serif"
-FONT_BODY = "'Inter', sans-serif"
-FONT_MONO = "'JetBrains Mono', monospace"
+outlier_marker_color = status_alert  # one consistent colour for every anomaly marker
 
-# Custom index string: sets global font, background, scrollbar and subtle card styling
+FONT_BODY = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+FONT_MONO = "ui-monospace, 'SF Mono', 'Roboto Mono', Consolas, 'Liberation Mono', Menlo, monospace"
+FONT_HEADING = FONT_BODY  # one type family; weight/size carry the hierarchy instead
+
+# Custom index string: global font, background, scrollbar, card + table styling
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -253,44 +259,109 @@ app.index_string = '''
                 background-color: ''' + bg_app + ''' !important;
                 font-family: ''' + FONT_BODY + ''';
             }
+
             ::-webkit-scrollbar { width: 10px; height: 10px; }
             ::-webkit-scrollbar-track { background: ''' + bg_app + '''; }
-            ::-webkit-scrollbar-thumb { background: ''' + border_soft + '''; border-radius: 6px; }
-            ::-webkit-scrollbar-thumb:hover { background: #33404F; }
+            ::-webkit-scrollbar-thumb { background: ''' + border_color + '''; border-radius: 6px; }
+            ::-webkit-scrollbar-thumb:hover { background: #2C333C; }
 
-            .plant-card {
-                background-color: ''' + bg_panel + ''';
-                border: 1px solid ''' + border_soft + ''';
-                border-radius: 14px;
-                overflow: hidden;
-                transition: box-shadow 0.2s ease, transform 0.2s ease;
-            }
-            .plant-card:hover {
-                box-shadow: 0 8px 28px rgba(0,0,0,0.35);
-                transform: translateY(-2px);
-            }
-            .plant-card-header {
-                background-color: ''' + bg_panel_alt + ''';
-                border-bottom: 1px solid ''' + border_soft + ''';
-                padding: 16px 20px;
-            }
-            .plant-card-body { padding: 18px 20px 22px 20px; }
-
-            .metric-pill {
-                font-family: ''' + FONT_MONO + ''';
-                font-size: 11px;
-                letter-spacing: 0.06em;
-                padding: 3px 10px;
-                border-radius: 999px;
-                border: 1px solid currentColor;
+            :focus-visible {
+                outline: 2px solid #4E79A7;
+                outline-offset: 2px;
             }
 
             .app-navbar {
-                background: linear-gradient(90deg, #0B0F14 0%, #121821 60%, #0B0F14 100%);
-                border-bottom: 1px solid ''' + border_soft + ''';
+                background-color: ''' + bg_panel_header + ''';
+                border-bottom: 1px solid ''' + border_color + ''';
+            }
+
+            .logo-mark {
+                width: 30px;
+                height: 30px;
+                border: 1px solid ''' + border_color + ''';
+                border-radius: 6px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-family: ''' + FONT_MONO + ''';
+                font-weight: 600;
+                font-size: 12px;
+                color: ''' + text_primary + ''';
+                background-color: ''' + bg_panel + ''';
+                flex-shrink: 0;
+            }
+
+            .live-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                background-color: ''' + status_live + ''';
+                display: inline-block;
+                flex-shrink: 0;
+            }
+            @media (prefers-reduced-motion: no-preference) {
+                .live-dot { animation: pulse-dot 2.2s ease-in-out infinite; }
+            }
+            @keyframes pulse-dot {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.35; }
+            }
+
+            .plant-card {
+                background-color: ''' + bg_panel + ''';
+                border: 1px solid ''' + border_color + ''';
+                border-radius: 8px;
+                overflow: hidden;
+                transition: border-color 0.15s ease;
+            }
+            .plant-card:hover {
+                border-color: #333B46;
+            }
+            .plant-card-header {
+                background-color: ''' + bg_panel_header + ''';
+                border-bottom: 1px solid ''' + border_color + ''';
+                padding: 14px 18px;
+            }
+            .plant-card-body { padding: 16px 18px 20px 18px; }
+
+            .category-mark {
+                width: 9px;
+                height: 9px;
+                border-radius: 2px;
+                display: inline-block;
+                flex-shrink: 0;
+            }
+
+            .section-label {
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                color: ''' + text_secondary + ''';
+                padding-bottom: 8px;
+                border-bottom: 1px solid ''' + border_color + ''';
+                margin: 20px 0 12px 0;
+                display: flex;
+                align-items: center;
+                gap: 8px;
             }
 
             .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner table {
+                font-family: ''' + FONT_MONO + ''' !important;
+            }
+
+            .dash-table-container .previous-page,
+            .dash-table-container .next-page,
+            .dash-table-container .first-page,
+            .dash-table-container .last-page {
+                background-color: ''' + bg_panel_header + ''' !important;
+                border: 1px solid ''' + border_color + ''' !important;
+                color: ''' + text_secondary + ''' !important;
+            }
+            .dash-table-container input.current-page {
+                background-color: ''' + bg_panel_header + ''' !important;
+                border: 1px solid ''' + border_color + ''' !important;
+                color: ''' + text_primary + ''' !important;
                 font-family: ''' + FONT_MONO + ''' !important;
             }
         </style>
@@ -307,6 +378,24 @@ app.index_string = '''
 '''
 
 
+def _empty_figure(message='Waiting for stream data\u2026'):
+    """Themed placeholder shown before the first batch of data arrives (or on error)."""
+    return go.Figure(
+        layout=go.Layout(
+            plot_bgcolor=bg_chart,
+            paper_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            margin=dict(l=20, r=20, t=20, b=20),
+            annotations=[dict(
+                text=message,
+                showarrow=False,
+                font=dict(color=text_tertiary, family=FONT_BODY, size=12),
+            )],
+        )
+    )
+
+
 def build_plant_card(plant_type):
     """
     Build a themed dashboard card (graph + anomaly table) for a given plant type.
@@ -320,58 +409,40 @@ def build_plant_card(plant_type):
     return dbc.Col(
         html.Div(
             [
-                # Card header: icon + title + live status pill
+                # Card header: small category mark + title. No icon glyphs.
                 html.Div(
-                    dbc.Row(
+                    html.Div(
                         [
-                            dbc.Col(
-                                html.Div(
-                                    [
-                                        html.I(
-                                            className=theme['icon'],
-                                            style={'color': theme['accent'], 'fontSize': '22px', 'marginRight': '12px'}
-                                        ),
-                                        html.Div(
-                                            [
-                                                html.Span(
-                                                    plant_type,
-                                                    style={
-                                                        'fontFamily': FONT_HEADING,
-                                                        'fontWeight': '600',
-                                                        'fontSize': '18px',
-                                                        'color': text_primary,
-                                                        'display': 'block'
-                                                    }
-                                                ),
-                                                html.Span(
-                                                    theme['subtitle'],
-                                                    style={
-                                                        'fontFamily': FONT_BODY,
-                                                        'fontSize': '12px',
-                                                        'color': text_muted,
-                                                    }
-                                                ),
-                                            ],
-                                            style={'display': 'inline-block', 'verticalAlign': 'middle'}
-                                        ),
-                                    ],
-                                    style={'display': 'flex', 'alignItems': 'center'}
-                                ),
-                                width='auto'
+                            html.Span(
+                                className='category-mark',
+                                style={'backgroundColor': theme['accent'], 'marginRight': '10px'}
                             ),
-                            dbc.Col(
-                                html.Span(
-                                    "LIVE",
-                                    className='metric-pill',
-                                    style={'color': theme['accent']}
-                                ),
-                                width='auto',
-                                className='ms-auto d-flex align-items-center'
+                            html.Div(
+                                [
+                                    html.Span(
+                                        plant_type,
+                                        style={
+                                            'fontFamily': FONT_HEADING,
+                                            'fontWeight': '600',
+                                            'fontSize': '15px',
+                                            'color': text_primary,
+                                            'display': 'block',
+                                            'lineHeight': '1.3',
+                                        }
+                                    ),
+                                    html.Span(
+                                        theme['subtitle'],
+                                        style={
+                                            'fontFamily': FONT_BODY,
+                                            'fontSize': '12px',
+                                            'color': text_secondary,
+                                        }
+                                    ),
+                                ],
+                                style={'display': 'inline-block', 'verticalAlign': 'middle'}
                             ),
                         ],
-                        justify='between',
-                        align='center',
-                        className='g-0'
+                        style={'display': 'flex', 'alignItems': 'center'}
                     ),
                     className='plant-card-header'
                 ),
@@ -382,50 +453,42 @@ def build_plant_card(plant_type):
                         dcc.Graph(id=f'{slug}-graph', animate=False, config={'displayModeBar': False}),
                         html.Div(
                             [
-                                html.I(className='fa-solid fa-triangle-exclamation',
-                                       style={'color': outlier_marker_color, 'marginRight': '8px', 'fontSize': '13px'}),
                                 html.Span(
-                                    "Detected Anomalies",
-                                    style={
-                                        'fontFamily': FONT_HEADING,
-                                        'fontWeight': '600',
-                                        'fontSize': '14px',
-                                        'color': text_primary,
-                                        'letterSpacing': '0.02em',
-                                        'textTransform': 'uppercase'
-                                    }
+                                    className='category-mark',
+                                    style={'backgroundColor': status_alert, 'borderRadius': '50%'}
                                 ),
+                                html.Span("Detected Anomalies"),
                             ],
-                            style={'margin': '18px 0 10px 0', 'display': 'flex', 'alignItems': 'center'}
+                            className='section-label'
                         ),
                         dash_table.DataTable(
                             id=f'{slug}-table',
                             columns=[{'name': f.replace('_', ' ').title(), 'id': f} for f in features],
-                            style_table={'overflowX': 'auto', 'borderRadius': '8px', 'border': f'1px solid {border_soft}'},
+                            style_table={'overflowX': 'auto', 'borderRadius': '6px', 'border': f'1px solid {border_color}'},
                             style_cell={
                                 'textAlign': 'left',
                                 'minWidth': '100px',
                                 'backgroundColor': bg_panel,
                                 'color': text_primary,
-                                'border': f'1px solid {border_soft}',
+                                'border': f'1px solid {border_color}',
                                 'fontFamily': FONT_MONO,
                                 'fontSize': '12px',
                                 'padding': '8px 10px',
                             },
                             style_header={
-                                'backgroundColor': bg_panel_alt,
-                                'color': theme['accent'],
+                                'backgroundColor': bg_panel_header,
+                                'color': text_secondary,
                                 'fontWeight': '600',
                                 'fontFamily': FONT_BODY,
                                 'fontSize': '11px',
                                 'letterSpacing': '0.04em',
                                 'textTransform': 'uppercase',
-                                'border': f'1px solid {border_soft}',
+                                'border': f'1px solid {border_color}',
                             },
                             style_data_conditional=[
                                 {
                                     'if': {'row_index': 'odd'},
-                                    'backgroundColor': bg_panel_alt,
+                                    'backgroundColor': bg_panel_header,
                                 }
                             ],
                             style_as_list_view=True,
@@ -435,9 +498,10 @@ def build_plant_card(plant_type):
                     className='plant-card-body'
                 ),
             ],
-            className='plant-card'
+            className='plant-card',
+            style={'borderLeft': f'3px solid {theme["accent"]}'}
         ),
-        xs=12, lg=12,
+        xs=12, xl=6,
         style={'marginBottom': '24px'}
     )
 
@@ -453,8 +517,7 @@ app.layout = html.Div(
                         dbc.Col(
                             html.Div(
                                 [
-                                    html.I(className='fa-solid fa-bolt',
-                                           style={'color': '#FFD23F', 'fontSize': '22px', 'marginRight': '12px'}),
+                                    html.Div("CE", className='logo-mark'),
                                     html.Div(
                                         [
                                             html.Span(
@@ -462,7 +525,7 @@ app.layout = html.Div(
                                                 style={
                                                     'fontFamily': FONT_HEADING,
                                                     'fontWeight': '700',
-                                                    'fontSize': '20px',
+                                                    'fontSize': '18px',
                                                     'color': text_primary,
                                                     'display': 'block',
                                                     'lineHeight': '1.2'
@@ -473,23 +536,35 @@ app.layout = html.Div(
                                                 style={
                                                     'fontFamily': FONT_BODY,
                                                     'fontSize': '12px',
-                                                    'color': text_muted,
-                                                    'letterSpacing': '0.02em'
+                                                    'color': text_secondary,
+                                                    'letterSpacing': '0.01em'
                                                 }
                                             ),
                                         ],
-                                        style={'display': 'inline-block', 'verticalAlign': 'middle'}
+                                        style={'marginLeft': '12px'}
                                     ),
                                 ],
-                                style={'display': 'flex', 'alignItems': 'center', 'padding': '16px 0'}
+                                style={'display': 'flex', 'alignItems': 'center', 'padding': '14px 0'}
                             ),
                             width='auto'
                         ),
                         dbc.Col(
-                            html.Span(
-                                "REAL-TIME GRID MONITORING",
-                                className='metric-pill',
-                                style={'color': '#3DDC97'}
+                            html.Div(
+                                [
+                                    html.Span(className='live-dot'),
+                                    html.Span(
+                                        "Live",
+                                        style={
+                                            'fontFamily': FONT_MONO,
+                                            'fontSize': '11px',
+                                            'letterSpacing': '0.06em',
+                                            'textTransform': 'uppercase',
+                                            'color': text_secondary,
+                                            'marginLeft': '8px',
+                                        }
+                                    ),
+                                ],
+                                style={'display': 'flex', 'alignItems': 'center'}
                             ),
                             width='auto',
                             className='ms-auto d-flex align-items-center'
@@ -524,15 +599,12 @@ app.layout = html.Div(
         html.Footer(
             dbc.Container(
                 html.P(
-                    [
-                        html.I(className='fa-solid fa-bolt', style={'marginRight': '8px', 'color': text_muted}),
-                        "Real-Time Energy Efficient Data Stream Anomaly Detection — by Vinay"
-                    ],
+                    "Real-Time Energy Efficient Data Stream Anomaly Detection \u2014 by Vinay",
                     className="text-center",
-                    style={'color': text_muted, 'padding': '18px', 'fontFamily': FONT_BODY, 'fontSize': '12px', 'margin': 0}
+                    style={'color': text_tertiary, 'padding': '18px', 'fontFamily': FONT_BODY, 'fontSize': '12px', 'margin': 0}
                 )
             ),
-            style={'borderTop': f'1px solid {border_soft}', 'marginTop': '32px'}
+            style={'borderTop': f'1px solid {border_color}', 'marginTop': '32px'}
         )
     ],
     style={'backgroundColor': bg_app, 'minHeight': '100vh', 'paddingBottom': '20px'}
@@ -568,7 +640,7 @@ def update_graphs(n):
             for plant_type in plant_types:
                 data_entries = data_store[plant_type]['data']
                 if not data_entries:
-                    figures.append(go.Figure())
+                    figures.append(_empty_figure())
                     table_data.append([])
                     continue
 
@@ -578,8 +650,6 @@ def update_graphs(n):
                 # Plot time series
                 features = plant_features[plant_type]
                 data_traces = []
-                # Line colors themed per plant type for better visibility against dark background
-                line_colors = plant_theme[plant_type]['line_colors']
 
                 for i, feature in enumerate(features):
                     data_traces.append(
@@ -588,7 +658,7 @@ def update_graphs(n):
                             y=data_df[feature],
                             mode='lines',
                             name=f'{feature.replace("_", " ").title()}',
-                            line=dict(width=2, color=line_colors[i % len(line_colors)]),
+                            line=dict(width=2, color=FEATURE_COLORS.get(feature, text_secondary)),
                             hoverinfo='text',
                             hovertext=[
                                 f'Time: {t}<br>{feature.replace("_", " ").title()}: {v:.2f}'
@@ -597,7 +667,9 @@ def update_graphs(n):
                         )
                     )
 
-                # Add outlier markers
+                # Add outlier markers. All four series are still plotted individually
+                # (same detection results as before) but share a single legend entry
+                # instead of four duplicate "Outliers (...)" rows.
                 if not outliers_df.empty:
                     for i, feature in enumerate(features):
                         data_traces.append(
@@ -605,7 +677,9 @@ def update_graphs(n):
                                 x=outliers_df['timestamp'],
                                 y=outliers_df[feature],
                                 mode='markers',
-                                name=f'Outliers ({feature.replace("_", " ").title()})',
+                                name='Anomaly',
+                                legendgroup='anomalies',
+                                showlegend=(i == 0),
                                 marker=dict(color=outlier_marker_color, size=8, symbol='x'),
                                 hoverinfo='text',
                                 hovertext=[
@@ -616,14 +690,39 @@ def update_graphs(n):
                         )
 
                 layout = go.Layout(
-                    xaxis=dict(title='Time', color='#2B2F36', gridcolor='#E4E7EC', zerolinecolor='#E4E7EC'),
-                    yaxis=dict(title='Values', color='#2B2F36', gridcolor='#E4E7EC', zerolinecolor='#E4E7EC'),
-                    legend=dict(x=0, y=1, font=dict(color='#2B2F36', size=10), bgcolor='rgba(255,255,255,0)'),
+                    xaxis=dict(
+                        color=text_secondary,
+                        gridcolor=grid_line,
+                        zerolinecolor=grid_line,
+                        showline=True,
+                        linecolor=border_color,
+                        tickfont=dict(size=10, color=text_secondary, family=FONT_MONO),
+                    ),
+                    yaxis=dict(
+                        color=text_secondary,
+                        gridcolor=grid_line,
+                        zerolinecolor=grid_line,
+                        showline=True,
+                        linecolor=border_color,
+                        tickfont=dict(size=10, color=text_secondary, family=FONT_MONO),
+                    ),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='bottom', y=1.02,
+                        xanchor='left', x=0,
+                        font=dict(color=text_secondary, size=10, family=FONT_BODY),
+                        bgcolor='rgba(0,0,0,0)',
+                    ),
                     hovermode='closest',
-                    plot_bgcolor='#FFFFFF',    # Chart background set to white
-                    paper_bgcolor='#FFFFFF',   # Chart surround set to white
-                    font=dict(color='#2B2F36', family=FONT_BODY),
-                    margin=dict(l=50, r=20, t=20, b=40),
+                    hoverlabel=dict(
+                        bgcolor=bg_panel_header,
+                        bordercolor=border_color,
+                        font=dict(color=text_primary, family=FONT_BODY, size=11)
+                    ),
+                    plot_bgcolor=bg_chart,
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color=text_secondary, family=FONT_BODY),
+                    margin=dict(l=44, r=16, t=48, b=32),
                 )
 
                 figures.append({'data': data_traces, 'layout': layout})
@@ -644,7 +743,7 @@ def update_graphs(n):
         )
     except Exception as e:
         logging.error(f"Error in update_graphs: {e}")
-        empty_figure = go.Figure()
+        empty_figure = _empty_figure('Something went wrong loading this stream')
         return empty_figure, [], empty_figure, [], empty_figure, [], empty_figure, []
 
 if __name__ == '__main__':
